@@ -1,37 +1,32 @@
 use anyhow::Context;
 use std::env;
-use std::error::Error;
 use std::str::SplitWhitespace;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp::ReadHalf, TcpListener, TcpStream},
 };
+use tokio_util::sync::CancellationToken;
 
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 1_000_000;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     let send_or_recv = env::args().nth(1).unwrap_or_else(|| "recv".to_string());
 
     let addr = env::args()
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:25".to_string());
 
-    println!("Started in {send_or_recv}");
-
     if send_or_recv == "recv" {
-        let listener = TcpListener::bind(addr).await?;
+        println!("Started in {send_or_recv}");
+        let ctoken = CancellationToken::new();
+        let cloned_token = ctoken.clone();
 
-        loop {
-            let (tcp_stream, remote_addr) = listener.accept().await?;
-
-            let remote_ip = remote_addr.ip().to_string();
-            println!("Accepted connection from {remote_ip}");
-
-            tokio::spawn(handle_connection(tcp_stream));
-        }
+        let listener: TcpListener = TcpListener::bind(addr).await?;
+        start_server(cloned_token, listener).await?;
     } else if send_or_recv == "send" {
+        println!("Started in {send_or_recv}");
         let mut stream = TcpStream::connect(addr).await?;
         println!("Stream connected");
 
@@ -74,11 +69,33 @@ Bob\r\n.\r\n",
 
         stream.write(b"QUIT\r\n").await?;
         stream.read(&mut buf).await?;
-
-        Ok(())
     } else {
-        Err(format!("Invalid mode {send_or_recv}").into())
+        anyhow::bail!("Invalid mode {send_or_recv}")
     }
+
+    Ok(())
+}
+
+async fn start_server(
+    cancel_token: CancellationToken,
+    listener: TcpListener,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                break
+            }
+            Ok((tcp_stream, remote_addr)) = listener.accept() => {
+                let remote_ip = remote_addr.ip().to_string();
+                println!("Accepted connection from {remote_ip}");
+
+                tokio::spawn(handle_connection(tcp_stream));
+            }
+        }
+    }
+
+    println!("Exiting server...");
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -337,4 +354,59 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
     println!("[{client_ip}] Connection closed");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // type ServerThreadHandle = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
+
+    async fn setup(ctoken: CancellationToken) -> anyhow::Result<String> {
+        let addr = "localhost:0";
+        let listener: TcpListener = TcpListener::bind(addr).await?;
+        let listen_addr = listener
+            .local_addr()
+            .expect("local address unavailable")
+            .to_string();
+
+        tokio::spawn(start_server(ctoken.clone(), listener));
+        Ok(listen_addr)
+    }
+
+    async fn teardown(ctoken: CancellationToken) -> anyhow::Result<()> {
+        ctoken.cancel();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn it_connects_to_smtp_server_and_gets_greeting() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+
+        let n = stream
+            .read(&mut buf)
+            .await
+            .expect("Failed to read server greeting from tcpstream");
+
+        let expected_greet_resp = "220 rs-mailserver\n";
+        let src_resp =
+            std::str::from_utf8(&buf[0..n]).expect("Got unexpected non-utf8 data from server");
+        assert_eq!(
+            src_resp, expected_greet_resp,
+            "Expected server to greet on connect",
+        );
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
 }
