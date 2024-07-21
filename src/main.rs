@@ -162,30 +162,88 @@ pub async fn read_command<'a>(
     Ok(content_iter)
 }
 
+#[derive(Copy, Clone)]
+enum SmtpState {
+    SmtpStateAwaitGreet,
+    SmtpStateAwaitFrom,
+    SmtpStateAwaitRcpt,
+    SmtpStateAwaitData,
+}
+
+impl std::fmt::Display for SmtpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SmtpStateAwaitGreet => write!(f, "SmtpStateAwaitGreet"),
+            Self::SmtpStateAwaitFrom => write!(f, "SmtpStateAwaitFrom"),
+            Self::SmtpStateAwaitRcpt => write!(f, "SmtpStateAwaitRcpt"),
+            Self::SmtpStateAwaitData => write!(f, "SmtpStateAwaitData"),
+        }
+    }
+}
+
+fn command_error_handler(
+    err: anyhow::Error,
+    state: SmtpState,
+    client_ip: &str,
+    command: &str,
+) -> anyhow::Error {
+    eprintln!("[{client_ip}] Failed to decode {command} command in state {state}: {err}");
+    err
+}
+
 async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
     let mut buf = Vec::with_capacity(64);
 
+    let client_addr = tcp_stream.peer_addr().map_err(|err| {
+        eprintln!("Unable to get connected client peer address: {err}");
+        return err;
+    })?;
+
+    let client_ip = client_addr.to_string();
     let (mut reader, mut writer) = tcp_stream.split();
 
+    println!("[{client_ip}] Greeting new client from");
+
+    writer.write(b"220 rs-mailserver\n").await.map_err(|err| {
+        eprintln!("[{client_ip}] Failed to greet client {err}");
+        return err;
+    })?;
+
+    let state = SmtpState::SmtpStateAwaitGreet;
+
     loop {
-        writer.write(b"220 rs-mailserver\n").await?;
+        let mut iter = read_command(&mut reader, 5 * 1000, &mut buf)
+            .await
+            .map_err(|err| {
+                eprintln!("[{client_ip}] Failed to read command in state {state}: {err}");
+                err
+            })?;
 
-        let mut iter = read_command(&mut reader, 5 * 1000, &mut buf).await?;
-
-        let command = iter.next().context("received empty command")?;
+        let command = iter
+            .next()
+            .context("received empty command")
+            .map_err(|err| {
+                eprintln!("[{client_ip}] Failed to decode next command in state {state}: {err}");
+                return err;
+            })?;
 
         match command {
             "HELO" => {
-                let fqdn = iter.next().context("expected fqdn or address")?;
+                let fqdn = iter
+                    .next()
+                    .context("expected fqdn or address")
+                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
                 println!("received HELO {fqdn}");
                 writer.write(b"250 Ok").await?;
             }
             "MAIL" => {
                 let from = iter
                     .next()
-                    .context("expected non-empty MAIL FROM command")?
+                    .context("expected non-empty MAIL FROM command")
+                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?
                     .strip_prefix("FROM:")
-                    .context("expected non-empty MAIL FROM command")?;
+                    .context("expected non-empty MAIL FROM command")
+                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
 
                 println!("received MAIL FROM {from}");
                 writer.write(b"250 Ok").await?;
@@ -193,9 +251,11 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
             "RCPT" => {
                 let to = iter
                     .next()
-                    .context("expected non-empty RCPT TO command")?
+                    .context("expected non-empty RCPT TO command")
+                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?
                     .strip_prefix("TO:")
-                    .context("expected non-empty RCPT TO command")?;
+                    .context("expected non-empty RCPT TO command")
+                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
 
                 println!("received RCPT TO {to}");
                 writer.write(b"250 Ok").await?;
@@ -205,16 +265,26 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
 
                 writer
                     .write(b"354 End data with <CR><LF>.<CR><LF>\n")
-                    .await?;
+                    .await
+                    .map_err(|err| {
+                        eprintln!(
+                            "[{client_ip}] Failed to send data to client in state {state}: {err}"
+                        );
+                        err
+                    })?;
 
                 let mut data_buf = vec![0; 0];
                 let mut ok = false;
                 loop {
                     let n = read_more(&mut reader, 5 * 1000, MAX_SOCKET_READ_BYTES, &mut data_buf)
-                        .await?;
+                        .await
+                        .map_err(|err| {
+                            eprintln!("[{client_ip}] Failed to read DATA from client in state {state}: {err}");
+                            err
+                        })?;
 
                     if n == 0 {
-                        // stream ended abruptly
+                        eprintln!("[{client_ip}] Failed to read DATA from client in state {state} (read 0 bytes)");
                         break;
                     }
 
@@ -229,7 +299,9 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                 if ok {
                     match std::str::from_utf8(&data_buf) {
                         Ok(v) => println!("DATA:\n{v}"),
-                        Err(e) => panic!("Received invalid UTF-8 DATA from client: {}", e),
+                        Err(err) => eprintln!(
+                            "[{client_ip}] Received invalid UTF-8 DATA from client: {err}"
+                        ),
                     };
                 } else {
                     println!("Received invalid DATA from client");
