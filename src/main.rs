@@ -100,7 +100,7 @@ pub async fn read_more(
     max_read_size: usize,
     to: &mut Vec<u8>,
 ) -> anyhow::Result<usize> {
-    const TMP_BUFFER_SIZE: usize = 64;
+    const TMP_BUFFER_SIZE: usize = 4096;
 
     let mut total_read = 0;
     let mut current_timeout = timeout_ms;
@@ -114,7 +114,7 @@ pub async fn read_more(
                         break;
                     }
 
-                    if total_read + num_bytes > max_read_size {
+                    if total_read + num_bytes + to.len() >= max_read_size {
                         return Err(anyhow::anyhow!(SocketReadError::PayloadTooLargeError));
                     }
 
@@ -142,12 +142,19 @@ pub async fn read_more(
 pub async fn read_command<'a>(
     reader: &mut ReadHalf<'_>,
     timeout_ms: u64,
-    buf: &'a mut Vec<u8>,
+    to: &'a mut Vec<u8>,
 ) -> anyhow::Result<SplitWhitespace<'a>> {
-    // let mut buf = Vec::with_capacity(64);
-    let n = read_more(reader, timeout_ms, MAX_SOCKET_READ_BYTES, buf).await?;
+    let mut n: usize = 0;
 
-    let content_iter = match std::str::from_utf8(buf) {
+    loop {
+        n += read_more(reader, timeout_ms, MAX_SOCKET_READ_BYTES, to).await?;
+
+        if to.ends_with(b"\r\n") {
+            break;
+        }
+    }
+
+    let content_iter = match std::str::from_utf8(to) {
         Ok(v) => v[0..n].split_whitespace(),
         Err(e) => panic!("Invalid UTF-8 sequence: {}", e),
     };
