@@ -209,7 +209,7 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
         return err;
     })?;
 
-    let state = SmtpState::SmtpStateAwaitGreet;
+    let mut state = SmtpState::SmtpStateAwaitGreet;
 
     loop {
         let mut iter = read_command(&mut reader, 5 * 1000, &mut buf)
@@ -227,16 +227,17 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                 return err;
             })?;
 
-        match command {
-            "HELO" => {
+        match (state, command) {
+            (SmtpState::SmtpStateAwaitGreet, "HELO") => {
                 let fqdn = iter
                     .next()
                     .context("expected fqdn or address")
                     .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
                 println!("received HELO {fqdn}");
                 writer.write(b"250 Ok").await?;
+                state = SmtpState::SmtpStateAwaitFrom;
             }
-            "MAIL" => {
+            (SmtpState::SmtpStateAwaitFrom, "MAIL") => {
                 let from = iter
                     .next()
                     .context("expected non-empty MAIL FROM command")
@@ -247,8 +248,9 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
 
                 println!("received MAIL FROM {from}");
                 writer.write(b"250 Ok").await?;
+                state = SmtpState::SmtpStateAwaitRcpt;
             }
-            "RCPT" => {
+            (SmtpState::SmtpStateAwaitRcpt, "RCPT") => {
                 let to = iter
                     .next()
                     .context("expected non-empty RCPT TO command")
@@ -260,7 +262,7 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                 println!("received RCPT TO {to}");
                 writer.write(b"250 Ok").await?;
             }
-            "DATA" => {
+            (SmtpState::SmtpStateAwaitRcpt, "DATA") => {
                 println!("received DATA command");
 
                 writer
@@ -272,6 +274,8 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                         );
                         err
                     })?;
+
+                state = SmtpState::SmtpStateAwaitData;
 
                 let mut data_buf = vec![0; 0];
                 let mut ok = false;
@@ -304,25 +308,33 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                         ),
                     };
                 } else {
-                    println!("Received invalid DATA from client");
+                    println!("[{client_ip}] Received invalid DATA from client");
                 }
             }
+            (_, "QUIT") => {
+                writer.write(b"221 Bye").await?;
+                let _ = writer.shutdown().await;
+                break;
+            }
             _ => {
-                writer.write(b"500 Command not recognized\n").await?;
+                eprintln!(
+                    "[{client_ip}] Received unknown/invalid command \"{command}\" in state {state}"
+                );
+                writer
+                    .write(b"500 Command not recognized\n")
+                    .await
+                    .map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to send message to client {err}");
+                        return err;
+                    })?;
                 // anyhow::bail!("Unexpected message received: {command}",),
             }
         }
 
-        // println!("CMD: {command}");
-        // while let Some(msg) = iter.next() {
-        //     println!("{msg}")
-        // }
-
         buf.clear();
     }
 
-    // todo
-    println!("Connection closed");
+    println!("[{client_ip}] Connection closed");
 
     Ok(())
 }
