@@ -423,8 +423,32 @@ mod tests {
         Ok(())
     }
 
+    async fn smtp_send_and_recv(
+        stream: &mut TcpStream,
+        recv_buf: &mut Vec<u8>,
+        command: &[u8],
+        expect: &str,
+    ) {
+        stream
+            .write(command)
+            .await
+            .expect("Failed to write to tcpstream");
+
+        let n = stream
+            .read(recv_buf)
+            .await
+            .expect("Failed to read from tcpstream");
+
+        let src_resp =
+            std::str::from_utf8(&recv_buf[0..n]).expect("Got unexpected non-utf8 data from server");
+        assert_eq!(
+            src_resp, expect,
+            "Expected server to reply with specific response"
+        );
+    }
+
     #[tokio::test]
-    async fn it_connects_to_smtp_server_and_gets_greeting() {
+    async fn it_connects_to_smtp_server_and_completes_mail_exchange() {
         let ctoken = CancellationToken::new();
         let srv_addr = setup(ctoken.clone())
             .await
@@ -441,14 +465,66 @@ mod tests {
             .await
             .expect("Failed to read server greeting from tcpstream");
 
-        let expected_greet_resp =
+        let expect_resp =
             String::from_utf8(MAILSERVER_GREET.to_vec()).expect("Unable to decode greet buffer");
         let src_resp =
             std::str::from_utf8(&buf[0..n]).expect("Got unexpected non-utf8 data from server");
-        assert_eq!(
-            src_resp, expected_greet_resp,
-            "Expected server to greet on connect",
-        );
+        assert_eq!(src_resp, expect_resp, "Expected server to greet on connect",);
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"HELO rs-mailserver-tester\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"RCPT TO:<alice@example.com>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"RCPT TO:<theboss@example.com>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"DATA\r\n",
+            "354 End data with <CR><LF>.<CR><LF>\r\n",
+        )
+        .await;
+
+        let mail_data = b"From: \"Bob Example\" <bob@example.org>
+To: \"Alice Example\" <alice@example.com>
+Cc: theboss@example.com
+Date: Tue, 15 Jan 2008 16:02:43 -0500
+Subject: Test message
+
+Hello Alice.
+This is a test message with 5 header fields and 4 lines in the message body.
+Your friend,
+Bob\r\n.\r\n";
+
+        smtp_send_and_recv(&mut stream, &mut buf, mail_data, "250 Ok\r\n").await;
+
+        smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", "221 Bye\r\n").await;
 
         teardown(ctoken)
             .await
