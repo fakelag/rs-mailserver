@@ -473,6 +473,22 @@ mod tests {
         );
     }
 
+    async fn smtp_expect_conn_close(stream: &mut TcpStream, recv_buf: &mut Vec<u8>) {
+        tokio::select! {
+            read_res = stream
+            .read(recv_buf) => {
+                if let Ok(read_bytes) = read_res {
+                    if read_bytes > 0 {
+                        panic!("Socket returned > 0 bytes unexpectedly");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                panic!("Connection was not timed out in expected time");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn it_connects_to_smtp_server_and_completes_mail_exchange() {
         let ctoken = CancellationToken::new();
@@ -651,19 +667,7 @@ Bob\r\n.\r\n";
         )
         .await;
 
-        tokio::select! {
-            read_res = stream
-            .read(&mut buf) => {
-                if let Ok(read_bytes) = read_res {
-                    if read_bytes > 0 {
-                        panic!("Socket returned > 0 bytes unexpectedly");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                panic!("Connection was not timed out in expected time");
-            }
-        }
+        smtp_expect_conn_close(&mut stream, &mut buf).await;
 
         stream = TcpStream::connect(srv_addr.as_str())
             .await
@@ -671,19 +675,90 @@ Bob\r\n.\r\n";
 
         smtp_expect_greet(&mut stream, &mut buf).await;
 
-        tokio::select! {
-            read_res = stream
-            .read(&mut buf) => {
-                if let Ok(read_bytes) = read_res {
-                    if read_bytes > 0 {
-                        panic!("Socket returned > 0 bytes unexpectedly");
-                    }
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
-                panic!("Connection was not timed out in expected time");
-            }
+        smtp_expect_conn_close(&mut stream, &mut buf).await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_aborts_connection_on_too_large_payload() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), None)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr.as_str())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+        let mut garbage_buffer = vec![b'A'; MAX_SOCKET_READ_BYTES + 1];
+
+        let helo = b"HELO ";
+
+        for (index, byte) in helo.iter().enumerate() {
+            garbage_buffer[index] = *byte;
         }
+
+        let gb_len = garbage_buffer.len();
+        garbage_buffer[gb_len - 2] = b'\r';
+        garbage_buffer[gb_len - 1] = b'\n';
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        stream
+            .write(garbage_buffer.as_slice())
+            .await
+            .expect("Failed to write to tcpstream");
+
+        smtp_expect_conn_close(&mut stream, &mut buf).await;
+
+        stream = TcpStream::connect(srv_addr.as_str())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"HELO rs-mailserver-tester\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"RCPT TO:<alice@example.com>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"DATA\r\n",
+            "354 End data with <CR><LF>.<CR><LF>\r\n",
+        )
+        .await;
+
+        stream
+            .write(garbage_buffer.as_slice())
+            .await
+            .expect("Failed to write to tcpstream");
+
+        smtp_expect_conn_close(&mut stream, &mut buf).await;
 
         teardown(ctoken)
             .await
