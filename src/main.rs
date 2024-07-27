@@ -8,7 +8,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
-const MAX_SOCKET_READ_BYTES: usize = 1_000_000;
+const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
+const MAX_SOCKET_TIMEOUT_MS: u64 = 15 * 1000;
 const MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
 
 #[tokio::main]
@@ -25,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
         let cloned_token = ctoken.clone();
 
         let listener: TcpListener = TcpListener::bind(addr).await?;
-        start_server(cloned_token, listener).await?;
+        start_server(cloned_token, listener, MAX_SOCKET_TIMEOUT_MS).await?;
     } else if send_or_recv == "send" {
         println!("Started in {send_or_recv}");
         let mut stream = TcpStream::connect(addr).await?;
@@ -80,6 +81,7 @@ Bob\r\n.\r\n",
 async fn start_server(
     cancel_token: CancellationToken,
     listener: TcpListener,
+    timeout_ms: u64,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -90,7 +92,7 @@ async fn start_server(
                 let remote_ip = remote_addr.ip().to_string();
                 println!("Accepted connection from {remote_ip}");
 
-                tokio::spawn(handle_connection(tcp_stream));
+                tokio::spawn(handle_connection(tcp_stream, timeout_ms));
             }
         }
     }
@@ -196,6 +198,7 @@ enum SmtpState {
     SmtpStateAwaitGreet,
     SmtpStateAwaitFrom,
     SmtpStateAwaitRcpt,
+    SmtpStateAwaitDataOrRcpt,
     SmtpStateAwaitData,
 }
 
@@ -205,6 +208,7 @@ impl std::fmt::Display for SmtpState {
             Self::SmtpStateAwaitGreet => write!(f, "SmtpStateAwaitGreet"),
             Self::SmtpStateAwaitFrom => write!(f, "SmtpStateAwaitFrom"),
             Self::SmtpStateAwaitRcpt => write!(f, "SmtpStateAwaitRcpt"),
+            Self::SmtpStateAwaitDataOrRcpt => write!(f, "SmtpStateAwaitDataOrRcpt"),
             Self::SmtpStateAwaitData => write!(f, "SmtpStateAwaitData"),
         }
     }
@@ -220,14 +224,18 @@ fn command_error_handler(
     err
 }
 
-async fn smtp_loop(tcp_stream: &mut TcpStream, client_ip: &str) -> anyhow::Result<()> {
+async fn smtp_loop(
+    tcp_stream: &mut TcpStream,
+    client_ip: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
     let (mut reader, mut writer) = tcp_stream.split();
 
     let mut buf = Vec::with_capacity(64);
     let mut state = SmtpState::SmtpStateAwaitGreet;
 
     loop {
-        let mut iter = read_command(&mut reader, 15 * 1000, &mut buf)
+        let mut iter = read_command(&mut reader, timeout_ms, &mut buf)
             .await
             .map_err(|err| {
                 eprintln!("[{client_ip}] Failed to read command in state {state}: {err}");
@@ -273,7 +281,7 @@ async fn smtp_loop(tcp_stream: &mut TcpStream, client_ip: &str) -> anyhow::Resul
                 })?;
                 state = SmtpState::SmtpStateAwaitRcpt;
             }
-            (SmtpState::SmtpStateAwaitRcpt, "RCPT") => {
+            (SmtpState::SmtpStateAwaitRcpt | SmtpState::SmtpStateAwaitDataOrRcpt, "RCPT") => {
                 let to = iter
                     .next()
                     .context("expected non-empty RCPT TO command")
@@ -287,8 +295,9 @@ async fn smtp_loop(tcp_stream: &mut TcpStream, client_ip: &str) -> anyhow::Resul
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
+                state = SmtpState::SmtpStateAwaitDataOrRcpt;
             }
-            (SmtpState::SmtpStateAwaitRcpt, "DATA") => {
+            (SmtpState::SmtpStateAwaitDataOrRcpt, "DATA") => {
                 println!("received DATA command");
 
                 writer
@@ -366,7 +375,7 @@ async fn smtp_loop(tcp_stream: &mut TcpStream, client_ip: &str) -> anyhow::Resul
     Ok(())
 }
 
-async fn handle_connection(mut tcp_stream: TcpStream) {
+async fn handle_connection(mut tcp_stream: TcpStream, timeout_ms: u64) {
     let client_addr_result = tcp_stream.peer_addr().map_err(|err| {
         eprintln!("Unable to get connected client peer address: {err}");
     });
@@ -389,7 +398,7 @@ async fn handle_connection(mut tcp_stream: TcpStream) {
         return;
     }
 
-    let result = smtp_loop(&mut tcp_stream, client_ip.as_str()).await;
+    let result = smtp_loop(&mut tcp_stream, client_ip.as_str(), timeout_ms).await;
 
     let _ = tcp_stream.shutdown().await;
 
@@ -406,7 +415,7 @@ mod tests {
 
     // type ServerThreadHandle = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
 
-    async fn setup(ctoken: CancellationToken) -> anyhow::Result<String> {
+    async fn setup(ctoken: CancellationToken, timeout_ms: Option<u64>) -> anyhow::Result<String> {
         let addr = "localhost:0";
         let listener: TcpListener = TcpListener::bind(addr).await?;
         let listen_addr = listener
@@ -414,13 +423,30 @@ mod tests {
             .expect("local address unavailable")
             .to_string();
 
-        tokio::spawn(start_server(ctoken.clone(), listener));
+        tokio::spawn(start_server(
+            ctoken.clone(),
+            listener,
+            timeout_ms.unwrap_or(MAX_SOCKET_TIMEOUT_MS),
+        ));
         Ok(listen_addr)
     }
 
     async fn teardown(ctoken: CancellationToken) -> anyhow::Result<()> {
         ctoken.cancel();
         Ok(())
+    }
+
+    async fn smtp_expect_greet(stream: &mut TcpStream, recv_buf: &mut Vec<u8>) {
+        let n = stream
+            .read(recv_buf)
+            .await
+            .expect("Failed to read server greeting from tcpstream");
+
+        let expect_resp =
+            String::from_utf8(MAILSERVER_GREET.to_vec()).expect("Unable to decode greet buffer");
+        let src_resp =
+            std::str::from_utf8(&recv_buf[0..n]).expect("Got unexpected non-utf8 data from server");
+        assert_eq!(src_resp, expect_resp, "Expected server to greet on connect",);
     }
 
     async fn smtp_send_and_recv(
@@ -450,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn it_connects_to_smtp_server_and_completes_mail_exchange() {
         let ctoken = CancellationToken::new();
-        let srv_addr = setup(ctoken.clone())
+        let srv_addr = setup(ctoken.clone(), None)
             .await
             .expect("Test setup did not complete successfully");
 
@@ -460,16 +486,7 @@ mod tests {
 
         let mut buf = vec![0; 1024];
 
-        let n = stream
-            .read(&mut buf)
-            .await
-            .expect("Failed to read server greeting from tcpstream");
-
-        let expect_resp =
-            String::from_utf8(MAILSERVER_GREET.to_vec()).expect("Unable to decode greet buffer");
-        let src_resp =
-            std::str::from_utf8(&buf[0..n]).expect("Got unexpected non-utf8 data from server");
-        assert_eq!(src_resp, expect_resp, "Expected server to greet on connect",);
+        smtp_expect_greet(&mut stream, &mut buf).await;
 
         smtp_send_and_recv(
             &mut stream,
@@ -525,6 +542,148 @@ Bob\r\n.\r\n";
         smtp_send_and_recv(&mut stream, &mut buf, mail_data, "250 Ok\r\n").await;
 
         smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", "221 Bye\r\n").await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_responds_correctly_to_unknown_command() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), None)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"FOO 123\r\n",
+            "500 Command not recognized\r\n",
+        )
+        .await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_responds_correctly_to_out_of_order_commands() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), None)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            "500 Command not recognized\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"HELO rs-mailserver-tester\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"DATA\r\n",
+            "500 Command not recognized\r\n",
+        )
+        .await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_timeouts_idle_connection() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), Some(100))
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr.as_str())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"HELO rs-mailserver-tester\r\n",
+            "250 Ok\r\n",
+        )
+        .await;
+
+        tokio::select! {
+            read_res = stream
+            .read(&mut buf) => {
+                if let Ok(read_bytes) = read_res {
+                    if read_bytes > 0 {
+                        panic!("Socket returned > 0 bytes unexpectedly");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                panic!("Connection was not timed out in expected time");
+            }
+        }
+
+        stream = TcpStream::connect(srv_addr.as_str())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        tokio::select! {
+            read_res = stream
+            .read(&mut buf) => {
+                if let Ok(read_bytes) = read_res {
+                    if read_bytes > 0 {
+                        panic!("Socket returned > 0 bytes unexpectedly");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(300)) => {
+                panic!("Connection was not timed out in expected time");
+            }
+        }
 
         teardown(ctoken)
             .await
