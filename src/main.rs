@@ -10,11 +10,17 @@ use tokio_util::sync::CancellationToken;
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
 const MAX_SOCKET_TIMEOUT_MS: u64 = 15 * 1000;
-const MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
-const RESP_SYNTAX_ERROR: &[u8; 18] = b"500 Syntax error\r\n";
+
+const RESP_MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
+const RESP_END_DATA_WITH: &[u8; 37] = b"354 End data with <CR><LF>.<CR><LF>\r\n";
 const RESP_OK: &[u8; 8] = b"250 Ok\r\n";
+const RESP_BYE: &[u8; 9] = b"221 Bye\r\n";
+
+const RESP_UNKNOWN_COMMAND: &[u8; 28] = b"500 Command not recognized\r\n";
+const RESP_SYNTAX_ERROR: &[u8; 18] = b"500 Syntax error\r\n";
 
 #[tokio::main]
+#[cfg(not(tarpaulin_include))]
 async fn main() -> anyhow::Result<()> {
     let addr = env::args()
         .nth(2)
@@ -300,13 +306,10 @@ async fn smtp_loop(
             (SmtpState::SmtpStateAwaitDataOrRcpt, "DATA") => {
                 println!("received DATA command");
 
-                writer
-                    .write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
-                    .await
-                    .map_err(|err| {
-                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
-                        err
-                    })?;
+                writer.write(RESP_END_DATA_WITH).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
 
                 state = SmtpState::SmtpStateAwaitData;
 
@@ -360,7 +363,7 @@ async fn smtp_loop(
                 }
             }
             (_, "QUIT") => {
-                writer.write(b"221 Bye\r\n").await.map_err(|err| {
+                writer.write(RESP_BYE).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
@@ -370,13 +373,10 @@ async fn smtp_loop(
                 eprintln!(
                     "[{client_ip}] Received unknown/invalid command \"{command}\" in state {state}"
                 );
-                writer
-                    .write(b"500 Command not recognized\r\n")
-                    .await
-                    .map_err(|err| {
-                        eprintln!("[{client_ip}] Failed to send message to client {err}");
-                        return err;
-                    })?;
+                writer.write(RESP_UNKNOWN_COMMAND).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to send message to client {err}");
+                    return err;
+                })?;
                 // anyhow::bail!("Unexpected message received: {command}",),
             }
         }
@@ -401,10 +401,13 @@ async fn handle_connection(ct: CancellationToken, mut tcp_stream: TcpStream, tim
 
     println!("[{client_ip}] Greeting new client");
 
-    let greet_write_result = tcp_stream.write(MAILSERVER_GREET).await.map_err(|err| {
-        eprintln!("[{client_ip}] Failed to greet client {err}");
-        return err;
-    });
+    let greet_write_result = tcp_stream
+        .write(RESP_MAILSERVER_GREET)
+        .await
+        .map_err(|err| {
+            eprintln!("[{client_ip}] Failed to greet client {err}");
+            return err;
+        });
 
     if let Err(_) = greet_write_result {
         return;
@@ -454,8 +457,8 @@ mod tests {
             .await
             .expect("Failed to read server greeting from tcpstream");
 
-        let expect_resp =
-            String::from_utf8(MAILSERVER_GREET.to_vec()).expect("Unable to decode greet buffer");
+        let expect_resp = String::from_utf8(RESP_MAILSERVER_GREET.to_vec())
+            .expect("Unable to decode greet buffer");
         let src_resp =
             std::str::from_utf8(&recv_buf[0..n]).expect("Got unexpected non-utf8 data from server");
         assert_eq!(src_resp, expect_resp, "Expected server to greet on connect",);
@@ -465,7 +468,7 @@ mod tests {
         stream: &mut TcpStream,
         recv_buf: &mut Vec<u8>,
         command: &[u8],
-        expect: &str,
+        expect: &[u8],
     ) {
         stream
             .write(command)
@@ -477,10 +480,11 @@ mod tests {
             .await
             .expect("Failed to read from tcpstream");
 
+        let exp_resp = std::str::from_utf8(expect).expect("Unexpected non-utf8 expect content");
         let src_resp =
             std::str::from_utf8(&recv_buf[0..n]).expect("Got unexpected non-utf8 data from server");
         assert_eq!(
-            src_resp, expect,
+            src_resp, exp_resp,
             "Expected server to reply with specific response"
         );
     }
@@ -520,9 +524,7 @@ mod tests {
             &mut stream,
             &mut buf,
             b"HELO rs-mailserver-tester\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -530,9 +532,7 @@ mod tests {
             &mut stream,
             &mut buf,
             b"MAIL FROM:<bob@example.org>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -540,9 +540,7 @@ mod tests {
             &mut stream,
             &mut buf,
             b"RCPT TO:<alice@example.com>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -550,19 +548,11 @@ mod tests {
             &mut stream,
             &mut buf,
             b"RCPT TO:<theboss@example.com>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"DATA\r\n",
-            "354 End data with <CR><LF>.<CR><LF>\r\n",
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"DATA\r\n", RESP_END_DATA_WITH).await;
 
         let mail_data = b"From: \"Bob Example\" <bob@example.org>
 To: \"Alice Example\" <alice@example.com>
@@ -575,17 +565,9 @@ This is a test message with 5 header fields and 4 lines in the message body.
 Your friend,
 Bob\r\n.\r\n";
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            mail_data,
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, mail_data, RESP_OK).await;
 
-        smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", "221 Bye\r\n").await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", RESP_BYE).await;
 
         teardown(ctoken)
             .await
@@ -607,13 +589,7 @@ Bob\r\n.\r\n";
 
         smtp_expect_greet(&mut stream, &mut buf).await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"FOO 123\r\n",
-            "500 Command not recognized\r\n",
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"FOO 123\r\n", RESP_UNKNOWN_COMMAND).await;
 
         teardown(ctoken)
             .await
@@ -640,15 +616,7 @@ Bob\r\n.\r\n";
             .await
             .expect("Failed to write to tcpstream");
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"\r\n", RESP_SYNTAX_ERROR).await;
 
         teardown(ctoken)
             .await
@@ -670,83 +638,37 @@ Bob\r\n.\r\n";
 
         smtp_expect_greet(&mut stream, &mut buf).await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"HELO\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"HELO\r\n", RESP_SYNTAX_ERROR).await;
 
         smtp_send_and_recv(
             &mut stream,
             &mut buf,
             b"HELO rs-mailserver-tester\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"MAIL\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"MAIL\r\n", RESP_SYNTAX_ERROR).await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"MAIL FROM:\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"MAIL FROM:\r\n", RESP_SYNTAX_ERROR).await;
 
         smtp_send_and_recv(
             &mut stream,
             &mut buf,
             b"MAIL FROM:<bob@example.org>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"RCPT\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"RCPT\r\n", RESP_SYNTAX_ERROR).await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"RCPT TO:\r\n",
-            String::from_utf8(RESP_SYNTAX_ERROR.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"RCPT TO:\r\n", RESP_SYNTAX_ERROR).await;
 
         smtp_send_and_recv(
             &mut stream,
             &mut buf,
             b"RCPT TO:<alice@example.com>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -774,7 +696,7 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"MAIL FROM:<bob@example.org>\r\n",
-            "500 Command not recognized\r\n",
+            RESP_UNKNOWN_COMMAND,
         )
         .await;
 
@@ -782,9 +704,7 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"HELO rs-mailserver-tester\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -792,19 +712,11 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"MAIL FROM:<bob@example.org>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"DATA\r\n",
-            "500 Command not recognized\r\n",
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"DATA\r\n", RESP_UNKNOWN_COMMAND).await;
 
         teardown(ctoken)
             .await
@@ -830,9 +742,7 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"HELO rs-mailserver-tester\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -894,9 +804,7 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"HELO rs-mailserver-tester\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -904,9 +812,7 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"MAIL FROM:<bob@example.org>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
@@ -914,19 +820,11 @@ Bob\r\n.\r\n";
             &mut stream,
             &mut buf,
             b"RCPT TO:<alice@example.com>\r\n",
-            String::from_utf8(RESP_OK.to_vec())
-                .expect("Unable to decode utf-8")
-                .as_str(),
+            RESP_OK,
         )
         .await;
 
-        smtp_send_and_recv(
-            &mut stream,
-            &mut buf,
-            b"DATA\r\n",
-            "354 End data with <CR><LF>.<CR><LF>\r\n",
-        )
-        .await;
+        smtp_send_and_recv(&mut stream, &mut buf, b"DATA\r\n", RESP_END_DATA_WITH).await;
 
         stream
             .write(garbage_buffer.as_slice())
