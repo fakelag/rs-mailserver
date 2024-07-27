@@ -14,66 +14,17 @@ const MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let send_or_recv = env::args().nth(1).unwrap_or_else(|| "recv".to_string());
-
     let addr = env::args()
         .nth(2)
         .unwrap_or_else(|| "127.0.0.1:25".to_string());
 
-    if send_or_recv == "recv" {
-        println!("Started in {send_or_recv} {addr}");
-        let ctoken = CancellationToken::new();
-        let cloned_token = ctoken.clone();
+    let ctoken = CancellationToken::new();
+    let cloned_token = ctoken.clone();
 
-        let listener: TcpListener = TcpListener::bind(addr).await?;
-        start_server(cloned_token, listener, MAX_SOCKET_TIMEOUT_MS).await?;
-    } else if send_or_recv == "send" {
-        println!("Started in {send_or_recv}");
-        let mut stream = TcpStream::connect(addr).await?;
-        println!("Stream connected");
+    let listener: TcpListener = TcpListener::bind(addr.to_string()).await?;
 
-        let mut buf = vec![0; 1024];
-
-        stream.read(&mut buf).await?;
-
-        // https://en.wikipedia.org/wiki/Simple_Mail_Transfer_Protocol
-
-        stream.write(b"HELO todo\r\n").await?;
-        stream.read(&mut buf).await?;
-
-        stream.write(b"MAIL FROM:<bob@example.org>\r\n").await?;
-        stream.read(&mut buf).await?;
-
-        stream.write(b"RCPT TO:<alice@example.com>\r\n").await?;
-        stream.read(&mut buf).await?;
-
-        stream.write(b"RCPT TO:<theboss@example.com>\r\n").await?;
-        stream.read(&mut buf).await?;
-
-        stream.write(b"DATA\r\n").await?;
-        stream.read(&mut buf).await?;
-
-        stream
-            .write(
-                b"From: \"Bob Example\" <bob@example.org>
-To: \"Alice Example\" <alice@example.com>
-Cc: theboss@example.com
-Date: Tue, 15 Jan 2008 16:02:43 -0500
-Subject: Test message
-
-Hello Alice.
-This is a test message with 5 header fields and 4 lines in the message body.
-Your friend,
-Bob\r\n.\r\n",
-            )
-            .await?;
-        stream.read(&mut buf).await?;
-
-        stream.write(b"QUIT\r\n").await?;
-        stream.read(&mut buf).await?;
-    } else {
-        anyhow::bail!("Invalid mode {send_or_recv}")
-    }
+    println!("Server started. Listening to {addr}");
+    start_server(cloned_token, listener, MAX_SOCKET_TIMEOUT_MS).await?;
 
     Ok(())
 }
