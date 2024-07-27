@@ -30,20 +30,21 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn start_server(
-    cancel_token: CancellationToken,
+    ct: CancellationToken,
     listener: TcpListener,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
+            _ = ct.cancelled() => {
                 break
             }
             Ok((tcp_stream, remote_addr)) = listener.accept() => {
                 let remote_ip = remote_addr.ip().to_string();
                 println!("Accepted connection from {remote_ip}");
 
-                tokio::spawn(handle_connection(tcp_stream, timeout_ms));
+                let ct_copy = ct.clone();
+                tokio::spawn(handle_connection(ct_copy, tcp_stream, timeout_ms));
             }
         }
     }
@@ -56,6 +57,7 @@ async fn start_server(
 enum SocketReadError {
     PayloadTooLargeError,
     NoContentError,
+    ServerShutdown,
 }
 
 impl std::fmt::Display for SocketReadError {
@@ -63,11 +65,13 @@ impl std::fmt::Display for SocketReadError {
         match self {
             Self::PayloadTooLargeError => write!(f, "socket payload too large"),
             Self::NoContentError => write!(f, "no content received before timeout"),
+            Self::ServerShutdown => write!(f, "server shutting down"),
         }
     }
 }
 
 pub async fn read_more(
+    ct: CancellationToken,
     reader: &mut ReadHalf<'_>,
     timeout_ms: u64,
     max_read_size: usize,
@@ -102,6 +106,9 @@ pub async fn read_more(
                     return Err(read_err.into());
                 }
             }
+            _ = ct.cancelled() => {
+                return Err(anyhow::anyhow!(SocketReadError::ServerShutdown));
+            }
             _ = tokio::time::sleep(std::time::Duration::from_millis(current_timeout)) => {
                 break;
             }
@@ -112,6 +119,7 @@ pub async fn read_more(
 }
 
 pub async fn read_command<'a>(
+    ct: CancellationToken,
     reader: &mut ReadHalf<'_>,
     timeout_ms: u64,
     to: &'a mut Vec<u8>,
@@ -119,7 +127,8 @@ pub async fn read_command<'a>(
     let mut n: usize = 0;
 
     loop {
-        let curr_read_bytes = read_more(reader, timeout_ms, MAX_SOCKET_READ_BYTES, to).await?;
+        let curr_read_bytes =
+            read_more(ct.clone(), reader, timeout_ms, MAX_SOCKET_READ_BYTES, to).await?;
 
         if curr_read_bytes == 0 {
             break;
@@ -176,6 +185,7 @@ fn command_error_handler(
 }
 
 async fn smtp_loop(
+    ct: CancellationToken,
     tcp_stream: &mut TcpStream,
     client_ip: &str,
     timeout_ms: u64,
@@ -186,7 +196,7 @@ async fn smtp_loop(
     let mut state = SmtpState::SmtpStateAwaitGreet;
 
     loop {
-        let mut iter = read_command(&mut reader, timeout_ms, &mut buf)
+        let mut iter = read_command(ct.clone(), &mut reader, timeout_ms, &mut buf)
             .await
             .map_err(|err| {
                 eprintln!("[{client_ip}] Failed to read command in state {state}: {err}");
@@ -264,10 +274,18 @@ async fn smtp_loop(
                 let mut data_buf = vec![0; 0];
                 let mut ok = false;
                 loop {
-                    let n = read_more(&mut reader, 5 * 1000, MAX_SOCKET_READ_BYTES, &mut data_buf)
+                    let n = read_more(
+                        ct.clone(),
+                        &mut reader,
+                        5 * 1000,
+                        MAX_SOCKET_READ_BYTES,
+                        &mut data_buf,
+                    )
                         .await
                         .map_err(|err| {
-                            eprintln!("[{client_ip}] Failed to read DATA from client in state {state}: {err}");
+                        eprintln!(
+                            "[{client_ip}] Failed to read DATA from client in state {state}: {err}"
+                        );
                             err
                         })?;
 
@@ -326,7 +344,7 @@ async fn smtp_loop(
     Ok(())
 }
 
-async fn handle_connection(mut tcp_stream: TcpStream, timeout_ms: u64) {
+async fn handle_connection(ct: CancellationToken, mut tcp_stream: TcpStream, timeout_ms: u64) {
     let client_addr_result = tcp_stream.peer_addr().map_err(|err| {
         eprintln!("Unable to get connected client peer address: {err}");
     });
@@ -349,7 +367,7 @@ async fn handle_connection(mut tcp_stream: TcpStream, timeout_ms: u64) {
         return;
     }
 
-    let result = smtp_loop(&mut tcp_stream, client_ip.as_str(), timeout_ms).await;
+    let result = smtp_loop(ct, &mut tcp_stream, client_ip.as_str(), timeout_ms).await;
 
     let _ = tcp_stream.shutdown().await;
 
@@ -714,5 +732,26 @@ Bob\r\n.\r\n";
         teardown(ctoken)
             .await
             .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_closes_server_with_cancellation_token() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), None)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr.as_str())
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+
+        smtp_expect_conn_close(&mut stream, &mut buf).await;
     }
 }
