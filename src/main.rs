@@ -394,7 +394,7 @@ async fn handle_connection(ct: CancellationToken, mut tcp_stream: TcpStream, tim
 
     let client_ip: String;
     if let Ok(client_addr) = client_addr_result {
-        client_ip = client_addr.to_string().to_string();
+        client_ip = client_addr.to_string()
     } else {
         return;
     }
