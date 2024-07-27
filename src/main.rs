@@ -11,6 +11,8 @@ const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
 const MAX_SOCKET_TIMEOUT_MS: u64 = 15 * 1000;
 const MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
+const RESP_SYNTAX_ERROR: &[u8; 18] = b"500 Syntax error\r\n";
+const RESP_OK: &[u8; 8] = b"250 Ok\r\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,17 +56,21 @@ async fn start_server(
 }
 
 #[derive(Debug)]
-enum SocketReadError {
-    PayloadTooLargeError,
+enum SmtpError {
+    CommandParsingError(String),
     NoContentError,
+    PayloadTooLargeError,
     ServerShutdown,
 }
 
-impl std::fmt::Display for SocketReadError {
+impl std::fmt::Display for SmtpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PayloadTooLargeError => write!(f, "socket payload too large"),
+            Self::CommandParsingError(command_name) => {
+                write!(f, "invalid syntax for command \"{command_name}\"",)
+            }
             Self::NoContentError => write!(f, "no content received before timeout"),
+            Self::PayloadTooLargeError => write!(f, "socket payload too large"),
             Self::ServerShutdown => write!(f, "server shutting down"),
         }
     }
@@ -92,7 +98,7 @@ pub async fn read_more(
                     }
 
                     if total_read + num_bytes + to.len() >= max_read_size {
-                        return Err(anyhow::anyhow!(SocketReadError::PayloadTooLargeError));
+                        return Err(anyhow::anyhow!(SmtpError::PayloadTooLargeError));
                     }
 
                     total_read += num_bytes;
@@ -107,7 +113,7 @@ pub async fn read_more(
                 }
             }
             _ = ct.cancelled() => {
-                return Err(anyhow::anyhow!(SocketReadError::ServerShutdown));
+                return Err(anyhow::anyhow!(SmtpError::ServerShutdown));
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(current_timeout)) => {
                 break;
@@ -142,7 +148,7 @@ pub async fn read_command<'a>(
     }
 
     if n == 0 {
-        return Err(anyhow::anyhow!(SocketReadError::NoContentError));
+        return Err(anyhow::anyhow!(SmtpError::NoContentError));
     }
 
     let content_iter = match std::str::from_utf8(to) {
@@ -174,7 +180,7 @@ impl std::fmt::Display for SmtpState {
     }
 }
 
-fn command_error_handler(
+fn command_parsing_error_handler(
     err: anyhow::Error,
     state: SmtpState,
     client_ip: &str,
@@ -203,60 +209,93 @@ async fn smtp_loop(
                 err
             })?;
 
-        let command = iter
+        let command_result = iter
             .next()
             .context("received empty command")
-            .map_err(|err| {
-                eprintln!("[{client_ip}] Failed to decode next command in state {state}: {err}");
-                return err;
-            })?;
+            .map_err(|err| command_parsing_error_handler(err, state, &client_ip, "<empty>"));
+
+        let command = match command_result {
+            Ok(command) => command,
+            Err(e) => {
+                writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
+                return Err(e);
+            }
+        };
 
         match (state, command) {
             (SmtpState::SmtpStateAwaitGreet, "HELO") => {
-                let fqdn = iter
+                let fqdn_result = iter
                     .next()
                     .context("expected fqdn or address")
-                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
+                    .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
+                if let Ok(fqdn) = fqdn_result {
                 println!("received HELO {fqdn}");
 
-                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
                 state = SmtpState::SmtpStateAwaitFrom;
+                } else {
+                    writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                        err
+                    })?;
+                }
             }
             (SmtpState::SmtpStateAwaitFrom, "MAIL") => {
-                let from = iter
+                let from_result = iter
                     .next()
-                    .context("expected non-empty MAIL FROM command")
-                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?
+                    .map_or("", |x| x)
                     .strip_prefix("FROM:")
-                    .context("expected non-empty MAIL FROM command")
-                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
+                    .and_then(|val| if val.len() > 0 { Some(val) } else { None })
+                    .ok_or(anyhow::anyhow!(SmtpError::CommandParsingError(
+                        "MAIL FROM".to_string()
+                    )))
+                    .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
+                if let Ok(from) = from_result {
                 println!("received MAIL FROM {from}");
-                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
                 state = SmtpState::SmtpStateAwaitRcpt;
+                } else {
+                    writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                        err
+                    })?;
+                }
             }
             (SmtpState::SmtpStateAwaitRcpt | SmtpState::SmtpStateAwaitDataOrRcpt, "RCPT") => {
-                let to = iter
+                let to_result = iter
                     .next()
-                    .context("expected non-empty RCPT TO command")
-                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?
+                    .map_or("", |x| x)
                     .strip_prefix("TO:")
-                    .context("expected non-empty RCPT TO command")
-                    .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
+                    .and_then(|val| if val.len() > 0 { Some(val) } else { None })
+                    .ok_or(anyhow::anyhow!(SmtpError::CommandParsingError(
+                        "RCPT TO".to_string()
+                    )))
+                    .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
+                if let Ok(to) = to_result {
                 println!("received RCPT TO {to}");
-                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
                 state = SmtpState::SmtpStateAwaitDataOrRcpt;
+                } else {
+                    writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                        err
+                    })?;
+                }
             }
             (SmtpState::SmtpStateAwaitDataOrRcpt, "DATA") => {
                 println!("received DATA command");
@@ -297,7 +336,7 @@ async fn smtp_loop(
                     if data_buf.ends_with(EMAIL_TERM) {
                         data_buf.truncate(data_buf.len() - EMAIL_TERM.len());
                         ok = true;
-                        writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                        writer.write(RESP_OK).await.map_err(|err| {
                             eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                             err
                         })?;
@@ -314,6 +353,10 @@ async fn smtp_loop(
                     };
                 } else {
                     println!("[{client_ip}] Received invalid DATA from client");
+                    writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                        err
+                    })?;
                 }
             }
             (_, "QUIT") => {
