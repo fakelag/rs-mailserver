@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 1_000_000;
+const MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:25".to_string());
 
     if send_or_recv == "recv" {
-        println!("Started in {send_or_recv}");
+        println!("Started in {send_or_recv} {addr}");
         let ctoken = CancellationToken::new();
         let cloned_token = ctoken.clone();
 
@@ -101,12 +102,14 @@ async fn start_server(
 #[derive(Debug)]
 enum SocketReadError {
     PayloadTooLargeError,
+    NoContentError,
 }
 
 impl std::fmt::Display for SocketReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PayloadTooLargeError => write!(f, "socket payload too large"),
+            Self::NoContentError => write!(f, "no content received before timeout"),
         }
     }
 }
@@ -143,7 +146,6 @@ pub async fn read_more(
                     // Set timeout to 10ms while draining
                     current_timeout = 10;
                 } else if let Err(read_err) = read_result {
-                    println!("Error reading from socket: {read_err}");
                     return Err(read_err.into());
                 }
             }
@@ -164,11 +166,21 @@ pub async fn read_command<'a>(
     let mut n: usize = 0;
 
     loop {
-        n += read_more(reader, timeout_ms, MAX_SOCKET_READ_BYTES, to).await?;
+        let curr_read_bytes = read_more(reader, timeout_ms, MAX_SOCKET_READ_BYTES, to).await?;
+
+        if curr_read_bytes == 0 {
+            break;
+        }
+
+        n += curr_read_bytes;
 
         if to.ends_with(b"\r\n") {
             break;
         }
+    }
+
+    if n == 0 {
+        return Err(anyhow::anyhow!(SocketReadError::NoContentError));
     }
 
     let content_iter = match std::str::from_utf8(to) {
@@ -208,28 +220,14 @@ fn command_error_handler(
     err
 }
 
-async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
-    let mut buf = Vec::with_capacity(64);
-
-    let client_addr = tcp_stream.peer_addr().map_err(|err| {
-        eprintln!("Unable to get connected client peer address: {err}");
-        return err;
-    })?;
-
-    let client_ip = client_addr.to_string();
+async fn smtp_loop(tcp_stream: &mut TcpStream, client_ip: &str) -> anyhow::Result<()> {
     let (mut reader, mut writer) = tcp_stream.split();
 
-    println!("[{client_ip}] Greeting new client from");
-
-    writer.write(b"220 rs-mailserver\n").await.map_err(|err| {
-        eprintln!("[{client_ip}] Failed to greet client {err}");
-        return err;
-    })?;
-
+    let mut buf = Vec::with_capacity(64);
     let mut state = SmtpState::SmtpStateAwaitGreet;
 
     loop {
-        let mut iter = read_command(&mut reader, 5 * 1000, &mut buf)
+        let mut iter = read_command(&mut reader, 15 * 1000, &mut buf)
             .await
             .map_err(|err| {
                 eprintln!("[{client_ip}] Failed to read command in state {state}: {err}");
@@ -250,8 +248,13 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                     .next()
                     .context("expected fqdn or address")
                     .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
+
                 println!("received HELO {fqdn}");
-                writer.write(b"250 Ok").await?;
+
+                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
                 state = SmtpState::SmtpStateAwaitFrom;
             }
             (SmtpState::SmtpStateAwaitFrom, "MAIL") => {
@@ -264,7 +267,10 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                     .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
 
                 println!("received MAIL FROM {from}");
-                writer.write(b"250 Ok").await?;
+                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
                 state = SmtpState::SmtpStateAwaitRcpt;
             }
             (SmtpState::SmtpStateAwaitRcpt, "RCPT") => {
@@ -277,18 +283,19 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                     .map_err(|err| command_error_handler(err, state, &client_ip, command))?;
 
                 println!("received RCPT TO {to}");
-                writer.write(b"250 Ok").await?;
+                writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
             }
             (SmtpState::SmtpStateAwaitRcpt, "DATA") => {
                 println!("received DATA command");
 
                 writer
-                    .write(b"354 End data with <CR><LF>.<CR><LF>\n")
+                    .write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                     .await
                     .map_err(|err| {
-                        eprintln!(
-                            "[{client_ip}] Failed to send data to client in state {state}: {err}"
-                        );
+                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                         err
                     })?;
 
@@ -312,7 +319,10 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                     if data_buf.ends_with(EMAIL_TERM) {
                         data_buf.truncate(data_buf.len() - EMAIL_TERM.len());
                         ok = true;
-                        writer.write(b"250 Ok").await?;
+                        writer.write(b"250 Ok\r\n").await.map_err(|err| {
+                            eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                            err
+                        })?;
                         break;
                     }
                 }
@@ -329,8 +339,10 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                 }
             }
             (_, "QUIT") => {
-                writer.write(b"221 Bye").await?;
-                let _ = writer.shutdown().await;
+                writer.write(b"221 Bye\r\n").await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
                 break;
             }
             _ => {
@@ -338,7 +350,7 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
                     "[{client_ip}] Received unknown/invalid command \"{command}\" in state {state}"
                 );
                 writer
-                    .write(b"500 Command not recognized\n")
+                    .write(b"500 Command not recognized\r\n")
                     .await
                     .map_err(|err| {
                         eprintln!("[{client_ip}] Failed to send message to client {err}");
@@ -351,9 +363,41 @@ async fn handle_connection(mut tcp_stream: TcpStream) -> anyhow::Result<()> {
         buf.clear();
     }
 
-    println!("[{client_ip}] Connection closed");
-
     Ok(())
+}
+
+async fn handle_connection(mut tcp_stream: TcpStream) {
+    let client_addr_result = tcp_stream.peer_addr().map_err(|err| {
+        eprintln!("Unable to get connected client peer address: {err}");
+    });
+
+    let client_ip: String;
+    if let Ok(client_addr) = client_addr_result {
+        client_ip = client_addr.to_string().to_string();
+    } else {
+        return;
+    }
+
+    println!("[{client_ip}] Greeting new client");
+
+    let greet_write_result = tcp_stream.write(MAILSERVER_GREET).await.map_err(|err| {
+        eprintln!("[{client_ip}] Failed to greet client {err}");
+        return err;
+    });
+
+    if let Err(_) = greet_write_result {
+        return;
+    }
+
+    let result = smtp_loop(&mut tcp_stream, client_ip.as_str()).await;
+
+    let _ = tcp_stream.shutdown().await;
+
+    if let Ok(_) = result {
+        println!("[{client_ip}] Exchange completed successfully");
+    } else {
+        println!("[{client_ip}] Connection closed due to error");
+    }
 }
 
 #[cfg(test)]
@@ -397,7 +441,8 @@ mod tests {
             .await
             .expect("Failed to read server greeting from tcpstream");
 
-        let expected_greet_resp = "220 rs-mailserver\n";
+        let expected_greet_resp =
+            String::from_utf8(MAILSERVER_GREET.to_vec()).expect("Unable to decode greet buffer");
         let src_resp =
             std::str::from_utf8(&buf[0..n]).expect("Got unexpected non-utf8 data from server");
         assert_eq!(
