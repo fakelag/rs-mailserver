@@ -1,5 +1,6 @@
 use anyhow::Context;
-use std::str::SplitWhitespace;
+use email_address::EmailAddress;
+use std::str::{FromStr, SplitWhitespace};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{tcp::ReadHalf, TcpListener, TcpStream},
@@ -17,6 +18,27 @@ const RESP_BYE: &[u8] = b"221 Bye\r\n";
 
 const RESP_UNKNOWN_COMMAND: &[u8] = b"500 Command not recognized\r\n";
 const RESP_SYNTAX_ERROR: &[u8] = b"500 Syntax error\r\n";
+
+#[derive(Debug)]
+pub struct Email {
+    mail_from: String,
+    mail_to: String,
+    mail_content: String,
+}
+
+impl Email {
+    fn new() -> Email {
+        Email {
+            mail_from: "".to_string(),
+            mail_to: "".to_string(),
+            mail_content: "".to_string(),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        return self.mail_content.len() > 0 && self.mail_from.len() > 0 && self.mail_to.len() > 0;
+    }
+}
 
 pub async fn start_server(
     ct: CancellationToken,
@@ -189,6 +211,7 @@ async fn smtp_loop(
 
     let mut buf = Vec::with_capacity(64);
     let mut state = SmtpState::SmtpStateAwaitGreet;
+    let mut email = Email::new();
 
     loop {
         let mut iter = read_command(ct.clone(), &mut reader, timeout_ms, &mut buf)
@@ -253,6 +276,7 @@ async fn smtp_loop(
                 })?;
             }
             (_, "RSET") => {
+                email = Email::new();
                 state = SmtpState::SmtpStateAwaitGreet;
                 writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
@@ -277,7 +301,22 @@ async fn smtp_loop(
                     )))
                     .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
-                if let Ok(_from) = from_result {
+                if let Ok(from) = from_result {
+                    let from_addr_result = EmailAddress::from_str(from.trim_matches(['<', '>']))
+                        .map_err(|err| {
+                            eprintln!("[{client_ip}]: Failed to parse MAIL FROM:<email>: {err}");
+                            err
+                        });
+                    if let Ok(from_addr) = from_addr_result {
+                        email.mail_from = from_addr.to_string();
+                    } else {
+                        writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                            eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                            err
+                        })?;
+                        continue;
+                    }
+
                     writer.write(RESP_OK).await.map_err(|err| {
                         eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                         err
@@ -301,7 +340,29 @@ async fn smtp_loop(
                     )))
                     .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
-                if let Ok(_to) = to_result {
+                if let Ok(to) = to_result {
+                    if email.mail_to.len() == 0 {
+                        let to_addr_result = EmailAddress::from_str(to.trim_matches(['<', '>']))
+                            .map_err(|err| {
+                                eprintln!("[{client_ip}]: Failed to parse RCPT TO:<email>: {err}");
+                                err
+                            });
+                        if let Ok(to_addr) = to_addr_result {
+                            email.mail_to = to_addr.to_string();
+                        } else {
+                            writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
+                                eprintln!(
+                                    "[{client_ip}] Failed to write to stream in {state}: {err}"
+                                );
+                                err
+                            })?;
+                            continue;
+                        }
+                    } else {
+                        // TODO: Support multiple recipients
+                        println!("[{client_ip}] Skipping recipient {to} since multiple recipients are not supported")
+                    }
+
                     writer.write(RESP_OK).await.map_err(|err| {
                         eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                         err
@@ -358,7 +419,9 @@ async fn smtp_loop(
 
                 if ok {
                     match std::str::from_utf8(&data_buf) {
-                        Ok(v) => println!("[{client_ip}] DATA:\n{v}"),
+                        Ok(content) => {
+                            email.mail_content = content.to_string();
+                        }
                         Err(err) => eprintln!(
                             "[{client_ip}] Received invalid UTF-8 DATA from client: {err}"
                         ),
@@ -391,6 +454,10 @@ async fn smtp_loop(
         }
 
         buf.clear();
+    }
+
+    if email.is_valid() {
+        println!("Valid email received: {:?}", email)
     }
 
     Ok(())
