@@ -9,16 +9,18 @@ use tokio_util::sync::CancellationToken;
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
 
-const RESP_MAILSERVER_GREET: &[u8; 19] = b"220 rs-mailserver\r\n";
-const RESP_END_DATA_WITH: &[u8; 37] = b"354 End data with <CR><LF>.<CR><LF>\r\n";
-const RESP_OK: &[u8; 8] = b"250 Ok\r\n";
-const RESP_BYE: &[u8; 9] = b"221 Bye\r\n";
+const RESP_MAILSERVER_GREET: &[u8] = b"220 rs-mailserver\r\n";
+const RESP_END_DATA_WITH: &[u8] = b"354 End data with <CR><LF>.<CR><LF>\r\n";
+const RESP_OK: &[u8] = b"250 Ok\r\n";
+const RESP_AUTH_OK: &[u8] = b"235 Ok\n";
+const RESP_BYE: &[u8] = b"221 Bye\r\n";
 
-const RESP_UNKNOWN_COMMAND: &[u8; 28] = b"500 Command not recognized\r\n";
-const RESP_SYNTAX_ERROR: &[u8; 18] = b"500 Syntax error\r\n";
+const RESP_UNKNOWN_COMMAND: &[u8] = b"500 Command not recognized\r\n";
+const RESP_SYNTAX_ERROR: &[u8] = b"500 Syntax error\r\n";
 
 pub async fn start_server(
     ct: CancellationToken,
+    domain: &str,
     listener: TcpListener,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
@@ -32,7 +34,7 @@ pub async fn start_server(
                 println!("Accepted connection from {remote_ip}");
 
                 let ct_copy = ct.clone();
-                tokio::spawn(handle_connection(ct_copy, tcp_stream, timeout_ms));
+                tokio::spawn(handle_connection(ct_copy, tcp_stream, timeout_ms, domain.to_string().clone()));
             }
         }
     }
@@ -181,6 +183,7 @@ async fn smtp_loop(
     tcp_stream: &mut TcpStream,
     client_ip: &str,
     timeout_ms: u64,
+    srv_domain: &str,
 ) -> anyhow::Result<()> {
     let (mut reader, mut writer) = tcp_stream.split();
 
@@ -212,19 +215,29 @@ async fn smtp_loop(
         };
 
         match (state, command) {
-            (SmtpState::SmtpStateAwaitGreet, "HELO") => {
+            (SmtpState::SmtpStateAwaitGreet, "HELO" | "EHLO") => {
                 let fqdn_result = iter
                     .next()
                     .context("expected fqdn or address")
                     .map_err(|err| command_parsing_error_handler(err, state, &client_ip, command));
 
                 if let Ok(fqdn) = fqdn_result {
-                    println!("[{client_ip}] Identified as {fqdn}");
+                    println!("[{client_ip}] Identified as {fqdn} with {command}");
 
-                    writer.write(RESP_OK).await.map_err(|err| {
-                        eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
-                        err
-                    })?;
+                    if command == "EHLO" {
+                        let resp =
+                            format!("250-{srv_domain} Hello {fqdn}\r\n250 AUTH PLAIN LOGIN\r\n");
+
+                        writer.write(resp.as_bytes()).await.map_err(|err| {
+                            eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                            err
+                        })?;
+                    } else {
+                        writer.write(RESP_OK).await.map_err(|err| {
+                            eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                            err
+                        })?;
+                    }
                     state = SmtpState::SmtpStateAwaitFrom;
                 } else {
                     writer.write(RESP_SYNTAX_ERROR).await.map_err(|err| {
@@ -232,6 +245,26 @@ async fn smtp_loop(
                         err
                     })?;
                 }
+            }
+            (_, "AUTH") => {
+                writer.write(RESP_AUTH_OK).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
+            }
+            (_, "RSET") => {
+                state = SmtpState::SmtpStateAwaitGreet;
+                writer.write(RESP_OK).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
+            }
+            (_, "NOOP" | "HELP" | "INFO" | "VRFY" | "EXPN") => {
+                println!("Received command {command}");
+                writer.write(RESP_OK).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
+                    err
+                })?;
             }
             (SmtpState::SmtpStateAwaitFrom, "MAIL") => {
                 let from_result = iter
@@ -363,7 +396,12 @@ async fn smtp_loop(
     Ok(())
 }
 
-async fn handle_connection(ct: CancellationToken, mut tcp_stream: TcpStream, timeout_ms: u64) {
+async fn handle_connection(
+    ct: CancellationToken,
+    mut tcp_stream: TcpStream,
+    timeout_ms: u64,
+    srv_domain: String,
+) {
     let client_addr_result = tcp_stream.peer_addr().map_err(|err| {
         eprintln!("Unable to get connected client peer address: {err}");
     });
@@ -389,7 +427,14 @@ async fn handle_connection(ct: CancellationToken, mut tcp_stream: TcpStream, tim
         return;
     }
 
-    let result = smtp_loop(ct, &mut tcp_stream, client_ip.as_str(), timeout_ms).await;
+    let result = smtp_loop(
+        ct,
+        &mut tcp_stream,
+        client_ip.as_str(),
+        timeout_ms,
+        srv_domain.as_str(),
+    )
+    .await;
 
     let _ = tcp_stream.shutdown().await;
 
@@ -416,6 +461,7 @@ mod tests {
 
         tokio::spawn(start_server(
             ctoken.clone(),
+            "testserver",
             listener,
             timeout_ms.unwrap_or(15 * 1000),
         ));
@@ -544,6 +590,71 @@ Bob\r\n.\r\n";
         smtp_send_and_recv(&mut stream, &mut buf, mail_data, RESP_OK).await;
 
         smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", RESP_BYE).await;
+
+        teardown(ctoken)
+            .await
+            .expect("Test teardown did not complete successfully");
+    }
+
+    #[tokio::test]
+    async fn it_connects_to_smtp_server_and_uses_esmtp() {
+        let ctoken = CancellationToken::new();
+        let srv_addr = setup(ctoken.clone(), None)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut stream = TcpStream::connect(srv_addr)
+            .await
+            .expect("Test setup did not complete successfully");
+
+        let mut buf = vec![0; 1024];
+
+        smtp_expect_greet(&mut stream, &mut buf).await;
+
+        let ehlo_resp =
+            format!("250-testserver Hello rs-mailserver-tester\r\n250 AUTH PLAIN LOGIN\r\n");
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"EHLO rs-mailserver-tester\r\n",
+            ehlo_resp.as_bytes(),
+        )
+        .await;
+
+        smtp_send_and_recv(&mut stream, &mut buf, b"AUTH\r\n", RESP_AUTH_OK).await;
+
+        smtp_send_and_recv(&mut stream, &mut buf, b"RSET\r\n", RESP_OK).await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            RESP_UNKNOWN_COMMAND,
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"EHLO rs-mailserver-tester\r\n",
+            ehlo_resp.as_bytes(),
+        )
+        .await;
+
+        smtp_send_and_recv(
+            &mut stream,
+            &mut buf,
+            b"MAIL FROM:<bob@example.org>\r\n",
+            RESP_OK,
+        )
+        .await;
+
+        let commands = ["NOOP\r\n", "HELP\r\n", "INFO\r\n", "VRFY\r\n", "EXPN\r\n"];
+
+        for cmd in commands {
+            smtp_send_and_recv(&mut stream, &mut buf, cmd.as_bytes(), RESP_OK).await;
+        }
 
         teardown(ctoken)
             .await
