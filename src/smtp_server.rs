@@ -1,9 +1,11 @@
+use crate::mpsc::error::SendTimeoutError;
 use anyhow::Context;
 use email_address::EmailAddress;
 use std::str::{FromStr, SplitWhitespace};
+use tokio::sync::mpsc::Sender;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{tcp::ReadHalf, TcpListener, TcpStream},
+    net::{tcp::ReadHalf, tcp::WriteHalf, TcpListener, TcpStream},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -18,8 +20,11 @@ const RESP_BYE: &[u8] = b"221 Bye\r\n";
 
 const RESP_UNKNOWN_COMMAND: &[u8] = b"500 Command not recognized\r\n";
 const RESP_SYNTAX_ERROR: &[u8] = b"500 Syntax error\r\n";
+const RESP_BUSY_ERROR: &[u8] = b"450 mailbox unavailable\r\n";
+const RESP_SERVICE_UNAVAILABLE: &[u8] =
+    b"421 Service not available, closing transmission channel\r\n";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Email {
     mail_from: String,
     mail_to: String,
@@ -42,6 +47,7 @@ impl Email {
 
 pub async fn start_server(
     ct: CancellationToken,
+    tx: Sender<Email>,
     domain: &str,
     listener: TcpListener,
     timeout_ms: u64,
@@ -55,8 +61,7 @@ pub async fn start_server(
                 let remote_ip = remote_addr.ip().to_string();
                 println!("Accepted connection from {remote_ip}");
 
-                let ct_copy = ct.clone();
-                tokio::spawn(handle_connection(ct_copy, tcp_stream, timeout_ms, domain.to_string().clone()));
+                tokio::spawn(handle_connection(ct.clone(), tx.clone(), tcp_stream, timeout_ms, domain.to_string().clone()));
             }
         }
     }
@@ -70,6 +75,7 @@ enum SmtpError {
     CommandParsingError(String),
     NoContentError,
     PayloadTooLargeError,
+    RateLimitError,
     ServerShutdown,
 }
 
@@ -81,6 +87,7 @@ impl std::fmt::Display for SmtpError {
             }
             Self::NoContentError => write!(f, "no content received before timeout"),
             Self::PayloadTooLargeError => write!(f, "socket payload too large"),
+            Self::RateLimitError => write!(f, "rate limited, channel is too busy"),
             Self::ServerShutdown => write!(f, "server shutting down"),
         }
     }
@@ -200,8 +207,83 @@ fn command_parsing_error_handler(
     err
 }
 
+async fn send_email_channel<'a>(
+    ct: CancellationToken,
+    tx: &'a Sender<Email>,
+    email: Email,
+) -> anyhow::Result<(), SmtpError> {
+    tokio::select! {
+        send_result = tx.send_timeout(email, std::time::Duration::from_millis(100)) => {
+            if let Err(err) = send_result {
+               match err {
+                    SendTimeoutError::Timeout(_) => {
+                        eprintln!("ERROR: Email processing channel is too busy (capacity={}, max={}). Rejecting", tx.capacity(), tx.max_capacity());
+                        return Err(SmtpError::RateLimitError);
+                    }
+                    SendTimeoutError::Closed(_) => {
+                        eprintln!("ERROR: Email processing channel is closed. Rejecting");
+                        return Err(SmtpError::ServerShutdown);
+                    }
+                }
+            } else {
+                return Ok(());
+            }
+        },
+        _ = ct.cancelled() => {
+            return Err(SmtpError::ServerShutdown);
+        }
+    }
+}
+
+async fn handle_email<'a>(
+    ct: CancellationToken,
+    client_ip: &str,
+    writer: &mut WriteHalf<'a>,
+    tx: &'a Sender<Email>,
+    email: Email,
+    ok_resp: &[u8],
+) -> anyhow::Result<()> {
+    if !email.is_valid() {
+        writer.write(ok_resp).await.map_err(|err| {
+            eprintln!("[{client_ip}] Failed to write to stream: {err}");
+            err
+        })?;
+        return Ok(());
+    }
+
+    if let Err(err) = send_email_channel(ct, &tx, email).await {
+        match err {
+            SmtpError::RateLimitError => {
+                writer.write(RESP_BUSY_ERROR).await.map_err(|err| {
+                    eprintln!("[{client_ip}] Failed to write to stream: {err}");
+                    err
+                })?;
+                return Ok(());
+            }
+            _ => {
+                eprintln!("[{client_ip}] Unrecoverable error occurred when writing to email channel: {err}");
+                writer
+                    .write(RESP_SERVICE_UNAVAILABLE)
+                    .await
+                    .map_err(|err| {
+                        eprintln!("[{client_ip}] Failed to write to stream: {err}");
+                        err
+                    })?;
+                return Err(anyhow::anyhow!(err));
+            }
+        }
+    }
+
+    writer.write(ok_resp).await.map_err(|err| {
+        eprintln!("[{client_ip}] Failed to write to stream: {err}");
+        err
+    })?;
+    Ok(())
+}
+
 async fn smtp_loop(
     ct: CancellationToken,
+    tx: Sender<Email>,
     tcp_stream: &mut TcpStream,
     client_ip: &str,
     timeout_ms: u64,
@@ -271,14 +353,6 @@ async fn smtp_loop(
             }
             (_, "AUTH") => {
                 writer.write(RESP_AUTH_OK).await.map_err(|err| {
-                    eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
-                    err
-                })?;
-            }
-            (_, "RSET") => {
-                email = Email::new();
-                state = SmtpState::SmtpStateAwaitGreet;
-                writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
@@ -409,10 +483,6 @@ async fn smtp_loop(
                     if data_buf.ends_with(EMAIL_TERM) {
                         data_buf.truncate(data_buf.len() - EMAIL_TERM.len());
                         ok = true;
-                        writer.write(RESP_OK).await.map_err(|err| {
-                            eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
-                            err
-                        })?;
                         break;
                     }
                 }
@@ -421,6 +491,15 @@ async fn smtp_loop(
                     match std::str::from_utf8(&data_buf) {
                         Ok(content) => {
                             email.mail_content = content.to_string();
+                            handle_email(
+                                ct.clone(),
+                                client_ip,
+                                &mut writer,
+                                &tx,
+                                email.clone(),
+                                RESP_OK,
+                            )
+                            .await?;
                         }
                         Err(err) => eprintln!(
                             "[{client_ip}] Received invalid UTF-8 DATA from client: {err}"
@@ -433,12 +512,27 @@ async fn smtp_loop(
                         err
                     })?;
                 }
+                email = Email::new();
+                state = SmtpState::SmtpStateAwaitGreet;
             }
-            (_, "QUIT") => {
-                writer.write(RESP_BYE).await.map_err(|err| {
+            (_, "RSET") => {
+                email = Email::new();
+                state = SmtpState::SmtpStateAwaitGreet;
+                writer.write(RESP_OK).await.map_err(|err| {
                     eprintln!("[{client_ip}] Failed to write to stream in {state}: {err}");
                     err
                 })?;
+            }
+            (_, "QUIT") => {
+                handle_email(
+                    ct.clone(),
+                    client_ip,
+                    &mut writer,
+                    &tx,
+                    email.clone(),
+                    RESP_BYE,
+                )
+                .await?;
                 break;
             }
             _ => {
@@ -465,6 +559,7 @@ async fn smtp_loop(
 
 async fn handle_connection(
     ct: CancellationToken,
+    tx: Sender<Email>,
     mut tcp_stream: TcpStream,
     timeout_ms: u64,
     srv_domain: String,
@@ -496,6 +591,7 @@ async fn handle_connection(
 
     let result = smtp_loop(
         ct,
+        tx,
         &mut tcp_stream,
         client_ip.as_str(),
         timeout_ms,
@@ -514,11 +610,42 @@ async fn handle_connection(
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc;
+
     use super::*;
 
     // type ServerThreadHandle = tokio::task::JoinHandle<Result<(), anyhow::Error>>;
 
     async fn setup(ctoken: CancellationToken, timeout_ms: Option<u64>) -> anyhow::Result<String> {
+        let (tx, mut rx) = mpsc::channel::<Email>(10);
+
+        let ctoken_copy = ctoken.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    recv_result = rx.recv() => {
+                        let mut ok = false;
+                        if let Some(email) = recv_result {
+                            ok = email.is_valid();
+                        }
+                        if !ok {
+                            panic!("ERROR: Error receiving from email channel");
+                        }
+                    }
+                    _ = ctoken_copy.cancelled() => {
+                        break;
+                    }
+                }
+            }
+        });
+        setup_with_receiver(ctoken, tx, timeout_ms).await
+    }
+
+    async fn setup_with_receiver(
+        ctoken: CancellationToken,
+        tx: Sender<Email>,
+        timeout_ms: Option<u64>,
+    ) -> anyhow::Result<String> {
         let addr = "localhost:0";
         let listener: TcpListener = TcpListener::bind(addr).await?;
         let listen_addr = listener
@@ -528,6 +655,7 @@ mod tests {
 
         tokio::spawn(start_server(
             ctoken.clone(),
+            tx,
             "testserver",
             listener,
             timeout_ms.unwrap_or(15 * 1000),
@@ -597,7 +725,26 @@ mod tests {
     #[tokio::test]
     async fn it_connects_to_smtp_server_and_completes_mail_exchange() {
         let ctoken = CancellationToken::new();
-        let srv_addr = setup(ctoken.clone(), None)
+        let (tx, mut rx) = mpsc::channel::<Email>(10);
+
+        let ctoken_copy = ctoken.clone();
+        let listener_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    recv_result = rx.recv() => {
+                        if let Some(email) = recv_result {
+                            return Some(email);
+                        }
+                    }
+                    _ = ctoken_copy.cancelled() => {
+                        break;
+                    }
+                }
+            }
+            None
+        });
+
+        let srv_addr = setup_with_receiver(ctoken.clone(), tx, None)
             .await
             .expect("Test setup did not complete successfully");
 
@@ -657,6 +804,28 @@ Bob\r\n.\r\n";
         smtp_send_and_recv(&mut stream, &mut buf, mail_data, RESP_OK).await;
 
         smtp_send_and_recv(&mut stream, &mut buf, b"QUIT\r\n", RESP_BYE).await;
+
+        tokio::select! {
+            listen_result = listener_handle => {
+                let received_email = listen_result.expect("Error occurred in receiver task").expect("Did not receive any emails in receiver task");
+
+                assert_eq!(
+                    received_email.is_valid(), true,
+                    "Expected receiver to receive a valid email"
+                );
+                assert_eq!(
+                    received_email.mail_from, "bob@example.org",
+                    "Expected receiver to have correct mail_from"
+                );
+                assert_eq!(
+                    received_email.mail_to, "alice@example.com",
+                    "Expected receiver to have correct mail_to"
+                );
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                panic!("Listener handle did not complete in time");
+            }
+        }
 
         teardown(ctoken)
             .await
