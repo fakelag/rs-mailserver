@@ -9,6 +9,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use super::email::Email;
+
 const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
 
@@ -24,34 +26,18 @@ const RESP_BUSY_ERROR: &[u8] = b"450 mailbox unavailable\r\n";
 const RESP_SERVICE_UNAVAILABLE: &[u8] =
     b"421 Service not available, closing transmission channel\r\n";
 
-#[derive(Debug, Clone)]
-pub struct Email {
-    mail_from: String,
-    mail_to: String,
-    mail_content: String,
-}
-
-impl Email {
-    fn new() -> Email {
-        Email {
-            mail_from: "".to_string(),
-            mail_to: "".to_string(),
-            mail_content: "".to_string(),
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        return self.mail_content.len() > 0 && self.mail_from.len() > 0 && self.mail_to.len() > 0;
-    }
-}
-
 pub async fn start_server(
     ct: CancellationToken,
     tx: Sender<Email>,
-    domain: &str,
+    domain: String,
     listener: TcpListener,
     timeout_ms: u64,
 ) -> anyhow::Result<()> {
+    println!(
+        "SMTP Server started. Listening to {addr} ({domain})",
+        addr = listener.local_addr()?
+    );
+
     loop {
         tokio::select! {
             _ = ct.cancelled() => {
@@ -61,7 +47,7 @@ pub async fn start_server(
                 let remote_ip = remote_addr.ip().to_string();
                 println!("Accepted connection from {remote_ip}");
 
-                tokio::spawn(handle_connection(ct.clone(), tx.clone(), tcp_stream, timeout_ms, domain.to_string().clone()));
+                tokio::spawn(handle_connection(ct.clone(), tx.clone(), tcp_stream, timeout_ms, domain.clone()));
             }
         }
     }
@@ -656,7 +642,7 @@ mod tests {
         tokio::spawn(start_server(
             ctoken.clone(),
             tx,
-            "testserver",
+            "testserver".to_string(),
             listener,
             timeout_ms.unwrap_or(15 * 1000),
         ));

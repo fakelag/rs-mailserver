@@ -1,10 +1,10 @@
-use smtp_server::Email;
 use std::env;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-pub mod smtp_server;
+mod mailserver;
+mod redis;
 
 const MAX_SOCKET_TIMEOUT_MS: u64 = 15 * 1000;
 
@@ -17,22 +17,31 @@ async fn main() -> anyhow::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "0.0.0.0:25".to_string());
 
-    let (tx, mut rx) = mpsc::channel::<Email>(10);
+    let (tx, mut rx) = mpsc::channel::<mailserver::email::Email>(10);
 
     let ctoken = CancellationToken::new();
-    let cloned_token = ctoken.clone();
 
     let listener: TcpListener = TcpListener::bind(addr.to_string()).await?;
 
-    println!("Server started. Listening to {addr} ({domain})");
-    smtp_server::start_server(
-        cloned_token,
+    let mut set = tokio::task::JoinSet::new();
+
+    set.spawn(redis::redis_storage::start_worker(ctoken.clone(), rx));
+
+    set.spawn(mailserver::smtp_server::start_server(
+        ctoken.clone(),
         tx,
-        domain.as_str(),
+        domain.clone(),
         listener,
         MAX_SOCKET_TIMEOUT_MS,
-    )
-    .await?;
+    ));
+
+    while let Some(join_res) = set.join_next().await {
+        if let Ok(res) = join_res {
+            println!("Handle completed with {:?}", res);
+        } else if let Err(err) = join_res {
+            println!("Handle errored with {:?}", err);
+        }
+    }
 
     Ok(())
 }
