@@ -1,5 +1,7 @@
+use smtp_server::Email;
 use std::env;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub mod smtp_server;
@@ -15,6 +17,8 @@ async fn main() -> anyhow::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "0.0.0.0:25".to_string());
 
+    let (tx, mut rx) = mpsc::channel::<Email>(10);
+
     let ctoken = CancellationToken::new();
     let cloned_token = ctoken.clone();
 
@@ -23,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     println!("Server started. Listening to {addr} ({domain})");
     smtp_server::start_server(
         cloned_token,
+        tx,
         domain.as_str(),
         listener,
         MAX_SOCKET_TIMEOUT_MS,
