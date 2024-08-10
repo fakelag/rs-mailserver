@@ -52,7 +52,7 @@ pub async fn start_server(
         }
     }
 
-    println!("Exiting server...");
+    println!("Exiting SMTP server...");
     Ok(())
 }
 
