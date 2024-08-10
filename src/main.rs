@@ -45,7 +45,9 @@ async fn main() -> anyhow::Result<()> {
             .nth(5)
             .context(format!("missing <mail_content> argument\n{send_usage}"))?;
 
-        return mailsender::smtp_sender::send(addr, mail_from, mail_to, mail_content).await;
+        mailsender::smtp_sender::send(addr, mail_from, mail_to, mail_content).await?;
+        println!("Ok");
+        return Ok(());
     } else if mode != "recv" {
         panic!("Invalid mode \"{mode}\". Expected help/send/recv")
     }
