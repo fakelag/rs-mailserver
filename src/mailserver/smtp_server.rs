@@ -11,19 +11,19 @@ use tokio_util::sync::CancellationToken;
 
 use super::email::Email;
 
-const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
 const MAX_SOCKET_READ_BYTES: usize = 512_000; // 512kb
 
-const RESP_MAILSERVER_GREET: &[u8] = b"220 rs-mailserver\r\n";
-const RESP_END_DATA_WITH: &[u8] = b"354 End data with <CR><LF>.<CR><LF>\r\n";
-const RESP_OK: &[u8] = b"250 Ok\r\n";
-const RESP_AUTH_OK: &[u8] = b"235 Ok\n";
-const RESP_BYE: &[u8] = b"221 Bye\r\n";
+pub const EMAIL_TERM: &[u8; 5] = b"\r\n.\r\n";
+pub const RESP_MAILSERVER_GREET: &[u8] = b"220 rs-mailserver\r\n";
+pub const RESP_END_DATA_WITH: &[u8] = b"354 End data with <CR><LF>.<CR><LF>\r\n";
+pub const RESP_OK: &[u8] = b"250 Ok\r\n";
+pub const RESP_AUTH_OK: &[u8] = b"235 Ok\n";
+pub const RESP_BYE: &[u8] = b"221 Bye\r\n";
 
-const RESP_UNKNOWN_COMMAND: &[u8] = b"500 Command not recognized\r\n";
-const RESP_SYNTAX_ERROR: &[u8] = b"500 Syntax error\r\n";
-const RESP_BUSY_ERROR: &[u8] = b"450 mailbox unavailable\r\n";
-const RESP_SERVICE_UNAVAILABLE: &[u8] =
+pub const RESP_UNKNOWN_COMMAND: &[u8] = b"500 Command not recognized\r\n";
+pub const RESP_SYNTAX_ERROR: &[u8] = b"500 Syntax error\r\n";
+pub const RESP_BUSY_ERROR: &[u8] = b"450 mailbox unavailable\r\n";
+pub const RESP_SERVICE_UNAVAILABLE: &[u8] =
     b"421 Service not available, closing transmission channel\r\n";
 
 pub async fn start_server(
